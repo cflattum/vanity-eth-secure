@@ -47,6 +47,11 @@ int g_pattern_total = 0;
 uint32_t g_pattern_target[5] = {0};
 uint32_t g_pattern_bitmask[5] = {0};
 
+#define BETA _uint256{0x7ae96a2b, 0x657c0710, 0x6e64479e, 0xac3434e9, 0x9cf04975, 0x12f58995, 0xc1396c28, 0x719501ee}
+#define BETA2 _uint256{0x851695d4, 0x9a83f8ef, 0x919bb861, 0x53cbcb16, 0x630fb68a, 0xed0a766a, 0x3ec693d6, 0x8e6afa40}
+#define LAMBDA _uint256{0x5363ad4c, 0xc05c30e0, 0xa5261c02, 0x8812645a, 0x122e22ea, 0x20816678, 0xdf02967c, 0x1b23bd72}
+#define LAMBDA2 _uint256{0xac9c52b3, 0x3fa3cf1f, 0x5ad9e3fd, 0x77ed9ba4, 0xa880b9fc, 0x8ec739c2, 0xe0cfc810, 0xb51283ce}
+
 
 #define OUTPUT_BUFFER_SIZE 10000
 
@@ -58,6 +63,8 @@ uint32_t g_pattern_bitmask[5] = {0};
 __constant__ CurvePoint thread_offsets[BLOCK_SIZE];
 __constant__ CurvePoint addends[THREAD_WORK - 1];
 __device__ uint64_t device_memory[2 + OUTPUT_BUFFER_SIZE * 3];
+
+__constant__ _uint256 d_beta = {0x7ae96a2b, 0x657c0710, 0x6e64479e, 0xac3434e9, 0x9cf04975, 0x12f58995, 0xc1396c28, 0x719501ee};
 
 __constant__ uint8_t pattern_nibbles[40];
 __constant__ uint8_t pattern_mask[40];
@@ -128,7 +135,7 @@ __device__ int score_pattern(Address a) {
     #define atomicAdd_ul(a, b) atomicAdd(a, b)
 #endif
 
-__device__ void handle_output(int score_method, Address a, uint64_t key, bool inv) {
+__device__ void handle_output(int score_method, Address a, uint64_t key, int variant) {
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
     else if (score_method == 1) { score = score_zero_bytes(a); }
@@ -141,7 +148,7 @@ __device__ void handle_output(int score_method, Address a, uint64_t key, bool in
             if (idx < OUTPUT_BUFFER_SIZE) {
                 device_memory[2 + idx] = key;
                 device_memory[OUTPUT_BUFFER_SIZE + 2 + idx] = score;
-                device_memory[OUTPUT_BUFFER_SIZE * 2 + 2 + idx] = inv;
+                device_memory[OUTPUT_BUFFER_SIZE * 2 + 2 + idx] = variant;
             }
         }
     }
@@ -367,7 +374,7 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
                 }
                 global_max_score_mutex.unlock();
 
-                double speed = GRID_WORK / elapsed / 1000000.0 * 2;
+                double speed = GRID_WORK / elapsed / 1000000.0 * 6;
                 if (output_counter_host[0] != 0) {
                     int valid_results = 0;
 
@@ -387,10 +394,18 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
                             uint64_t k_offset = output_buffer_host[i];
                             _uint256 k = cpu_add_256(previous_random_key, cpu_add_256(_uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK}, _uint256{0, 0, 0, 0, 0, 0, (uint32_t)(k_offset >> 32), (uint32_t)(k_offset & 0xFFFFFFFF)}));
 
-                            if (output_buffer3_host[i]) {
+                            int variant = (int)output_buffer3_host[i];
+                            bool negate = (variant & 1) != 0;
+                            int endo = variant >> 1;
+                            if (endo == 1) {
+                                k = cpu_mul_256_mod_n(k, LAMBDA);
+                            } else if (endo == 2) {
+                                k = cpu_mul_256_mod_n(k, LAMBDA2);
+                            }
+                            if (negate) {
                                 k = cpu_sub_256(N, k);
                             }
-                
+
                             int idx = valid_results++;
                             results[idx] = k;
                             scores[idx] = output_buffer2_host[i];

@@ -283,6 +283,38 @@ _uint256 cpu_mul_256_mod_p(_uint256 x, _uint256 y) {
 }
 
 
+_uint256 cpu_mul_256_mod_n(_uint256 x, _uint256 y) {
+    // N = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    // Double-and-add: result = 0; for each bit of y from MSB to LSB: result = 2*result mod N; if bit set: result = (result + x) mod N
+    _uint256 n_val = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFE, 0xBAAEDCE6, 0xAF48A03B, 0xBFD25E8C, 0xD0364141};
+    _uint256 result = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t y_words[8] = {y.a, y.b, y.c, y.d, y.e, y.f, y.g, y.h};
+    for (int word = 0; word < 8; word++) {
+        for (int bit = 31; bit >= 0; bit--) {
+            // result = 2 * result mod N
+            _uint256c doubled = cpu_add_256_with_c(result, result);
+            _uint256 d256 = {doubled.a, doubled.b, doubled.c, doubled.d, doubled.e, doubled.f, doubled.g, doubled.h};
+            if (doubled.carry || gte_256(d256, n_val)) {
+                result = cpu_sub_256(d256, n_val);
+            } else {
+                result = d256;
+            }
+            // if bit set: result = (result + x) mod N
+            if ((y_words[word] >> bit) & 1) {
+                _uint256c sum = cpu_add_256_with_c(result, x);
+                _uint256 s256 = {sum.a, sum.b, sum.c, sum.d, sum.e, sum.f, sum.g, sum.h};
+                if (sum.carry || gte_256(s256, n_val)) {
+                    result = cpu_sub_256(s256, n_val);
+                } else {
+                    result = s256;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+
 _uint256 cpu_rshift1_256(_uint256 x) {
     _uint256 result;
     result.a =               (x.a >> 1);
