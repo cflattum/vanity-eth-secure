@@ -54,6 +54,8 @@ uint32_t g_pattern_bitmask[5] = {0};
 
 
 #define OUTPUT_BUFFER_SIZE 10000
+#define COLLECT_BUFFER_SIZE 1024
+#define MAX_COLLECT_PATTERNS 4
 
 #define BLOCK_SIZE 256U
 #define THREAD_WORK (1U << 8)
@@ -63,6 +65,12 @@ uint32_t g_pattern_bitmask[5] = {0};
 __constant__ CurvePoint thread_offsets[BLOCK_SIZE];
 __constant__ CurvePoint addends[THREAD_WORK - 1];
 __device__ uint64_t device_memory[2 + OUTPUT_BUFFER_SIZE * 3];
+
+__device__ uint64_t collect_memory[1 + COLLECT_BUFFER_SIZE * 3];
+__constant__ uint32_t collect_targets[MAX_COLLECT_PATTERNS][5];
+__constant__ uint32_t collect_bitmasks[MAX_COLLECT_PATTERNS][5];
+__constant__ int collect_floors[MAX_COLLECT_PATTERNS];
+__constant__ int collect_pattern_count;
 
 __constant__ _uint256 d_beta = {0x7ae96a2b, 0x657c0710, 0x6e64479e, 0xac3434e9, 0x9cf04975, 0x12f58995, 0xc1396c28, 0x719501ee};
 
@@ -135,6 +143,35 @@ __device__ int score_pattern(Address a) {
     #define atomicAdd_ul(a, b) atomicAdd(a, b)
 #endif
 
+__device__ int score_collect_pattern(Address a, int pattern_idx) {
+    uint32_t words[5] = {a.a, a.b, a.c, a.d, a.e};
+    int score = 0;
+    #pragma unroll
+    for (int w = 0; w < 5; w++) {
+        uint32_t diff = words[w] ^ collect_targets[pattern_idx][w];
+        diff |= (diff >> 1);
+        diff |= (diff >> 2);
+        diff &= collect_bitmasks[pattern_idx][w];
+        score += __popc(~diff & collect_bitmasks[pattern_idx][w]);
+    }
+    return score;
+}
+
+__device__ void collect_output(Address a, uint64_t key, int variant) {
+    for (int p = 0; p < collect_pattern_count; p++) {
+        int score = score_collect_pattern(a, p);
+        if (score >= collect_floors[p]) {
+            uint32_t idx = atomicAdd_ul(&collect_memory[0], 1);
+            if (idx < COLLECT_BUFFER_SIZE) {
+                collect_memory[1 + idx] = key;
+                collect_memory[1 + COLLECT_BUFFER_SIZE + idx] = (uint64_t)score | ((uint64_t)p << 32);
+                collect_memory[1 + COLLECT_BUFFER_SIZE * 2 + idx] = variant;
+            }
+            break;
+        }
+    }
+}
+
 __device__ void handle_output(int score_method, Address a, uint64_t key, int variant) {
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
@@ -151,6 +188,10 @@ __device__ void handle_output(int score_method, Address a, uint64_t key, int var
                 device_memory[OUTPUT_BUFFER_SIZE * 2 + 2 + idx] = variant;
             }
         }
+    }
+
+    if (collect_pattern_count > 0) {
+        collect_output(a, key, variant);
     }
 }
 
@@ -170,6 +211,10 @@ __device__ void handle_output2(int score_method, Address a, uint64_t key) {
             }
         }
     }
+
+    if (collect_pattern_count > 0) {
+        collect_output(a, key, 0);
+    }
 }
 
 #include "address.h"
@@ -181,6 +226,14 @@ __device__ void handle_output2(int score_method, Address a, uint64_t key) {
 int global_max_score = 0;
 std::mutex global_max_score_mutex;
 uint32_t GRID_SIZE = 1U << 17;
+
+int g_collect_pattern_count = 0;
+uint32_t g_collect_targets[MAX_COLLECT_PATTERNS][5] = {{0}};
+uint32_t g_collect_bitmasks[MAX_COLLECT_PATTERNS][5] = {{0}};
+int g_collect_floors[MAX_COLLECT_PATTERNS] = {0};
+char g_collect_pattern_strs[MAX_COLLECT_PATTERNS][41] = {{0}};
+const char* g_collect_file = "collected.txt";
+std::mutex g_collect_file_mutex;
 
 struct Message {
     uint64_t time;
@@ -231,6 +284,12 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
     uint64_t* output_buffer2_host;
     uint64_t* output_buffer3_host;
 
+    uint64_t* collect_memory_host = 0;
+    uint64_t* collect_counter_host;
+    uint64_t* collect_buffer_keys;
+    uint64_t* collect_buffer_scores;
+    uint64_t* collect_buffer_variants;
+
     gpu_assert(cudaSetDevice(device));
 
     gpu_assert(cudaHostAlloc(&device_memory_host, (2 + OUTPUT_BUFFER_SIZE * 3) * sizeof(uint64_t), cudaHostAllocDefault))
@@ -240,15 +299,29 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
     output_buffer2_host = output_buffer_host + OUTPUT_BUFFER_SIZE;
     output_buffer3_host = output_buffer2_host + OUTPUT_BUFFER_SIZE;
 
+    gpu_assert(cudaHostAlloc(&collect_memory_host, (1 + COLLECT_BUFFER_SIZE * 3) * sizeof(uint64_t), cudaHostAllocDefault))
+    collect_counter_host = collect_memory_host;
+    collect_buffer_keys = collect_counter_host + 1;
+    collect_buffer_scores = collect_buffer_keys + COLLECT_BUFFER_SIZE;
+    collect_buffer_variants = collect_buffer_scores + COLLECT_BUFFER_SIZE;
+
     output_counter_host[0] = 0;
     max_score_host[0] = 2;
+    collect_counter_host[0] = 0;
     gpu_assert(cudaMemcpyToSymbol(device_memory, device_memory_host, 2 * sizeof(uint64_t)));
+    gpu_assert(cudaMemcpyToSymbol(collect_memory, collect_counter_host, sizeof(uint64_t)));
     if (score_method == 2) {
         gpu_assert(cudaMemcpyToSymbol(pattern_nibbles, g_pattern_nibbles, 40));
         gpu_assert(cudaMemcpyToSymbol(pattern_mask, g_pattern_mask, 40));
         gpu_assert(cudaMemcpyToSymbol(pattern_total, &g_pattern_total, sizeof(int)));
         gpu_assert(cudaMemcpyToSymbol(pattern_target, g_pattern_target, 5 * sizeof(uint32_t)));
         gpu_assert(cudaMemcpyToSymbol(pattern_bitmask, g_pattern_bitmask, 5 * sizeof(uint32_t)));
+    }
+    gpu_assert(cudaMemcpyToSymbol(collect_pattern_count, &g_collect_pattern_count, sizeof(int)));
+    if (g_collect_pattern_count > 0) {
+        gpu_assert(cudaMemcpyToSymbol(collect_targets, g_collect_targets, sizeof(g_collect_targets)));
+        gpu_assert(cudaMemcpyToSymbol(collect_bitmasks, g_collect_bitmasks, sizeof(g_collect_bitmasks)));
+        gpu_assert(cudaMemcpyToSymbol(collect_floors, g_collect_floors, sizeof(g_collect_floors)));
     }
     gpu_assert(cudaDeviceSynchronize())
 
@@ -362,6 +435,9 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
             if (!first_iteration) {
                 gpu_assert(cudaMemcpyFromSymbolAsync(device_memory_host, device_memory, (2 + OUTPUT_BUFFER_SIZE * 3) * sizeof(uint64_t), 0, cudaMemcpyDeviceToHost, streams[1]))
                 gpu_assert(cudaStreamSynchronize(streams[1]))
+                if (g_collect_pattern_count > 0) {
+                    gpu_assert(cudaMemcpyFromSymbol(collect_memory_host, collect_memory, (1 + COLLECT_BUFFER_SIZE * 3) * sizeof(uint64_t)))
+                }
             }
             if (!first_iteration) {
                 global_max_score_mutex.lock();
@@ -424,6 +500,43 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
                     message_queue.push(Message{end_time, 0, device_index, cudaSuccess, speed, 0});
                     message_queue_mutex.unlock();
                 }
+            }
+
+            if (!first_iteration && g_collect_pattern_count > 0) {
+                int collect_count = (int)collect_counter_host[0];
+                if (collect_count > COLLECT_BUFFER_SIZE) collect_count = COLLECT_BUFFER_SIZE;
+                if (collect_count > 0) {
+                    g_collect_file_mutex.lock();
+                    FILE* f = fopen(g_collect_file, "a");
+                    if (f) {
+                        for (int i = 0; i < collect_count; i++) {
+                            uint64_t k_offset = collect_buffer_keys[i];
+                            _uint256 k = cpu_add_256(previous_random_key, cpu_add_256(_uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK}, _uint256{0, 0, 0, 0, 0, 0, (uint32_t)(k_offset >> 32), (uint32_t)(k_offset & 0xFFFFFFFF)}));
+
+                            int variant = (int)collect_buffer_variants[i];
+                            bool negate = (variant & 1) != 0;
+                            int endo = variant >> 1;
+                            if (endo == 1) { k = cpu_mul_256_mod_n(k, LAMBDA); }
+                            else if (endo == 2) { k = cpu_mul_256_mod_n(k, LAMBDA2); }
+                            if (negate) { k = cpu_sub_256(N, k); }
+
+                            int score = (int)(collect_buffer_scores[i] & 0xFFFFFFFF);
+                            int pat_idx = (int)(collect_buffer_scores[i] >> 32);
+
+                            CurvePoint pt = cpu_point_multiply(G, k);
+                            if (g_use_seed_key) { pt = cpu_point_add(pt, g_seed_public_key); }
+                            Address addr = cpu_calculate_address(pt.x, pt.y);
+
+                            fprintf(f, "P%d Score:%02d Key:0x%08x%08x%08x%08x%08x%08x%08x%08x Addr:0x%08x%08x%08x%08x%08x\n",
+                                pat_idx, score, k.a, k.b, k.c, k.d, k.e, k.f, k.g, k.h,
+                                addr.a, addr.b, addr.c, addr.d, addr.e);
+                        }
+                        fclose(f);
+                    }
+                    g_collect_file_mutex.unlock();
+                }
+                collect_counter_host[0] = 0;
+                gpu_assert(cudaMemcpyToSymbol(collect_memory, collect_counter_host, sizeof(uint64_t)));
             }
 
             if (!first_iteration) {
@@ -672,6 +785,41 @@ int main(int argc, char *argv[]) {
         } else if  (strcmp(argv[i], "--work-scale") == 0 || strcmp(argv[i], "-w") == 0) {
             GRID_SIZE = 1U << atoi(argv[i + 1]);
             i += 2;
+        } else if (strcmp(argv[i], "--collect") == 0) {
+            if (g_collect_pattern_count >= MAX_COLLECT_PATTERNS) {
+                printf("Maximum %d collect patterns allowed\n", MAX_COLLECT_PATTERNS);
+                return 1;
+            }
+            int floor = atoi(argv[i + 1]);
+            const char* pat = argv[i + 2];
+            if (strlen(pat) != 40) {
+                printf("Collect pattern must be exactly 40 characters\n");
+                return 1;
+            }
+            int idx = g_collect_pattern_count;
+            g_collect_floors[idx] = floor;
+            strncpy(g_collect_pattern_strs[idx], pat, 40);
+            g_collect_pattern_strs[idx][40] = '\0';
+            for (int w = 0; w < 5; w++) {
+                uint32_t target = 0;
+                uint32_t bitmask = 0;
+                for (int n = 0; n < 8; n++) {
+                    int pidx = w * 8 + n;
+                    char c = pat[pidx];
+                    if (c != 'X' && c != 'x') {
+                        int v = parse_hex_char(c);
+                        target |= ((uint32_t)v) << (28 - n * 4);
+                        bitmask |= (1U << (28 - n * 4));
+                    }
+                }
+                g_collect_targets[idx][w] = target;
+                g_collect_bitmasks[idx][w] = bitmask;
+            }
+            g_collect_pattern_count++;
+            i += 3;
+        } else if (strcmp(argv[i], "--collect-file") == 0) {
+            g_collect_file = argv[i + 1];
+            i += 2;
         } else {
             i++;
         }
@@ -680,6 +828,10 @@ int main(int argc, char *argv[]) {
     if (num_devices == 0) {
         printf("No devices were specified\n");
         return 1;
+    }
+
+    if (score_method == -1 && g_collect_pattern_count > 0) {
+        score_method = 0;
     }
 
     if (score_method == -1) {
@@ -762,6 +914,14 @@ int main(int argc, char *argv[]) {
         }
         printf("Pattern: 0x%s (%d fixed nibbles)\n", input_pattern, fixed_count);
         printf("Full match at score %d\n\n", fixed_count);
+    }
+
+    if (g_collect_pattern_count > 0) {
+        printf("Collector: %d pattern(s), output to %s\n", g_collect_pattern_count, g_collect_file);
+        for (int i = 0; i < g_collect_pattern_count; i++) {
+            printf("  [%d] floor=%d pattern=0x%s\n", i, g_collect_floors[i], g_collect_pattern_strs[i]);
+        }
+        printf("\n");
     }
 
     for (int i = 0; i < num_devices; i++) {
