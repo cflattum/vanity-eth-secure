@@ -41,6 +41,10 @@
 CurvePoint g_seed_public_key = {_uint256{0,0,0,0,0,0,0,0}, _uint256{0,0,0,0,0,0,0,0}};
 bool g_use_seed_key = false;
 
+uint8_t g_pattern_nibbles[40] = {0};
+uint8_t g_pattern_mask[40] = {0};
+int g_pattern_total = 0;
+
 
 #define OUTPUT_BUFFER_SIZE 10000
 
@@ -52,6 +56,10 @@ bool g_use_seed_key = false;
 __constant__ CurvePoint thread_offsets[BLOCK_SIZE];
 __constant__ CurvePoint addends[THREAD_WORK - 1];
 __device__ uint64_t device_memory[2 + OUTPUT_BUFFER_SIZE * 3];
+
+__constant__ uint8_t pattern_nibbles[40];
+__constant__ uint8_t pattern_mask[40];
+__constant__ int pattern_total;
 
 __device__ int count_zero_bytes(uint32_t x) {
     int n = 0;
@@ -93,6 +101,20 @@ __device__ int score_leading_zeros(Address a) {
     return n >> 3;
 }
 
+__device__ int score_pattern(Address a) {
+    uint32_t words[5] = {a.a, a.b, a.c, a.d, a.e};
+    int score = 0;
+    for (int w = 0; w < 5; w++) {
+        uint32_t val = words[w];
+        for (int n = 0; n < 8; n++) {
+            int idx = w * 8 + n;
+            uint8_t nibble = (val >> (28 - n * 4)) & 0xF;
+            score += (pattern_mask[idx] && nibble == pattern_nibbles[idx]);
+        }
+    }
+    return score;
+}
+
 #ifdef __linux__
     #define atomicMax_ul(a, b) atomicMax((unsigned long long*)(a), (unsigned long long)(b))
     #define atomicAdd_ul(a, b) atomicAdd((unsigned long long*)(a), (unsigned long long)(b))
@@ -105,6 +127,7 @@ __device__ void handle_output(int score_method, Address a, uint64_t key, bool in
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
     else if (score_method == 1) { score = score_zero_bytes(a); }
+    else if (score_method == 2) { score = score_pattern(a); }
 
     if (score >= device_memory[1]) {
         atomicMax_ul(&device_memory[1], score);
@@ -123,6 +146,7 @@ __device__ void handle_output2(int score_method, Address a, uint64_t key) {
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
     else if (score_method == 1) { score = score_zero_bytes(a); }
+    else if (score_method == 2) { score = score_pattern(a); }
 
     if (score >= device_memory[1]) {
         atomicMax_ul(&device_memory[1], score);
@@ -207,6 +231,11 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
     output_counter_host[0] = 0;
     max_score_host[0] = 2;
     gpu_assert(cudaMemcpyToSymbol(device_memory, device_memory_host, 2 * sizeof(uint64_t)));
+    if (score_method == 2) {
+        gpu_assert(cudaMemcpyToSymbol(pattern_nibbles, g_pattern_nibbles, 40));
+        gpu_assert(cudaMemcpyToSymbol(pattern_mask, g_pattern_mask, 40));
+        gpu_assert(cudaMemcpyToSymbol(pattern_total, &g_pattern_total, sizeof(int)));
+    }
     gpu_assert(cudaDeviceSynchronize())
 
 
@@ -572,12 +601,13 @@ CurvePoint parse_public_key(const char* hex_str) {
 
 
 int main(int argc, char *argv[]) {
-    int score_method = -1; // 0 = leading zeroes, 1 = zeros
+    int score_method = -1; // 0 = leading zeroes, 1 = zeros, 2 = pattern
     int mode = 0; // 0 = address, 1 = contract, 2 = create2 contract, 3 = create3 proxy contract
     char* input_file = 0;
     char* input_address = 0;
     char* input_deployer_address = 0;
     char* input_public_key = 0;
+    char* input_pattern = 0;
 
     int num_devices = 0;
     int device_ids[10];
@@ -592,6 +622,10 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--zeros") == 0 || strcmp(argv[i], "-z") == 0) {
             score_method = 1;
             i++;
+        } else if (strcmp(argv[i], "--matching") == 0 || strcmp(argv[i], "-m") == 0) {
+            input_pattern = argv[i + 1];
+            score_method = 2;
+            i += 2;
         } else if (strcmp(argv[i], "--public-key") == 0 || strcmp(argv[i], "-p") == 0) {
             input_public_key = argv[i + 1];
             i += 2;
@@ -665,6 +699,34 @@ int main(int argc, char *argv[]) {
         g_use_seed_key = true;
         printf("Offset mode: GPU will add to provided public key\n");
         printf("Output values are OFFSETS — combine with your local private key\n\n");
+    }
+
+    if (input_pattern) {
+        if (strlen(input_pattern) != 40) {
+            printf("Pattern must be exactly 40 characters (20 bytes, no 0x prefix)\n");
+            printf("Use hex digits for fixed positions, X for wildcard\n");
+            return 1;
+        }
+        int fixed_count = 0;
+        for (int i = 0; i < 40; i++) {
+            char c = input_pattern[i];
+            if (c == 'X' || c == 'x') {
+                g_pattern_nibbles[i] = 0;
+                g_pattern_mask[i] = 0;
+            } else {
+                int v = parse_hex_char(c);
+                if (v < 0) {
+                    printf("Invalid character '%c' at position %d in pattern\n", c, i);
+                    return 1;
+                }
+                g_pattern_nibbles[i] = (uint8_t)v;
+                g_pattern_mask[i] = 1;
+                fixed_count++;
+            }
+        }
+        g_pattern_total = fixed_count;
+        printf("Pattern: 0x%s (%d fixed nibbles)\n", input_pattern, fixed_count);
+        printf("Full match at score %d\n\n", fixed_count);
     }
 
     for (int i = 0; i < num_devices; i++) {

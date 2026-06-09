@@ -36,18 +36,27 @@ nvcc src/main.cu -o vanity_eth_cuda -O2
 
 ## Usage
 
-**Normal mode** (private key output, same as upstream):
+**Leading zeros:**
 ```bash
 ./vanity_eth_cuda -d 0 -lz
 ```
 
-**Secure offset mode:**
+**Pattern matching** (hex digits for fixed positions, X for wildcard):
+```bash
+# Find 0xB00B1E......000
+./vanity_eth_cuda -d 0 -m b00b1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX000
+
+# Find 0xDEAD......BEEF
+./vanity_eth_cuda -d 0 -m deadXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXbeef
+```
+
+**Secure offset mode** (combine with any scoring mode):
 ```bash
 # On your local machine — generate base key
 npx tsx scripts/1-generate-base-key.ts
 
 # On GPU machine — run the grind with your public key
-./vanity_eth_cuda -d 0 -lz -p <128_hex_char_public_key>
+./vanity_eth_cuda -d 0 -m b00b1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX000 -p <128_hex_char_public_key>
 
 # Back on local machine — combine base key + offset
 npx tsx scripts/2-combine-key.ts <offset_from_gpu>
@@ -60,6 +69,7 @@ npx tsx scripts/2-combine-key.ts <offset_from_gpu>
 | `-d <n>` | GPU device index (required, use multiple `-d` for multi-GPU) |
 | `-lz` | Score by leading zeros |
 | `-z` | Score by total zeros |
+| `-m <pattern>` | Pattern match — 40 char hex pattern, X = wildcard |
 | `-p <pubkey>` | Offset mode — 128 hex char uncompressed public key (no 04 prefix) |
 | `-w <n>` | Work scale — grid size as power of 2 (default 15 = 32768) |
 
