@@ -15,6 +15,17 @@ Most vanity generators output raw private keys, which means whatever machine run
 
 The GPU never sees the private key. The offset alone is useless.
 
+## How scoring works
+
+The tool doesn't search for a specific pattern — it just scores addresses by how many zeros they have, and keeps improving until you kill it.
+
+- `-lz` (leading zeros) — scores by consecutive zeros at the start of the address. So `0x00000a...` scores 5.
+- `-z` (total zeros) — scores by total zero nibbles anywhere in the address. Good for addresses like `0x000000...000000` where you want zeros at both ends.
+
+It runs continuously and prints whenever it finds a better score. You just let it run until you're happy with what it found and grab the offset.
+
+Each hex digit is 4 bits of entropy, so every additional zero you want roughly 16x's the search time. 10 zeros ≈ minutes, 12 zeros ≈ hours, 14+ zeros ≈ days.
+
 ## Build
 
 Needs CUDA toolkit installed.
@@ -56,9 +67,14 @@ npx tsx scripts/2-combine-key.ts <offset_from_gpu>
 
 ~4-6 GH/s on an H100/H200, roughly 3-4x faster than profanity2's OpenCL implementation.
 
+The speed matters because vanity search is pure brute force — there's no shortcut. You're just hashing billions of public keys per second and checking if the resulting address looks good. Faster GPU = less wall time waiting.
+
 ## Scripts
 
 The `scripts/` folder has TypeScript helpers for the offset workflow. They need `ethers` installed (`npm install ethers`).
+
+- `1-generate-base-key.ts` — run locally, generates a random keypair, saves the private key and prints the public key to send to the GPU
+- `2-combine-key.ts` — run locally after the GPU finds something, takes the offset and combines it with your base key to produce the final wallet key
 
 ## License
 
