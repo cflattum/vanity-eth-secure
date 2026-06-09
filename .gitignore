@@ -1,0 +1,9 @@
+*.exe
+*.exp
+*.lib
+*.pdb
+*.o
+vanity_eth_cuda
+
+# Never commit keys
+scripts/keys/
