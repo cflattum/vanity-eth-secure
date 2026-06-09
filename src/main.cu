@@ -44,6 +44,8 @@ bool g_use_seed_key = false;
 uint8_t g_pattern_nibbles[40] = {0};
 uint8_t g_pattern_mask[40] = {0};
 int g_pattern_total = 0;
+uint32_t g_pattern_target[5] = {0};
+uint32_t g_pattern_bitmask[5] = {0};
 
 
 #define OUTPUT_BUFFER_SIZE 10000
@@ -60,6 +62,9 @@ __device__ uint64_t device_memory[2 + OUTPUT_BUFFER_SIZE * 3];
 __constant__ uint8_t pattern_nibbles[40];
 __constant__ uint8_t pattern_mask[40];
 __constant__ int pattern_total;
+
+__constant__ uint32_t pattern_target[5];
+__constant__ uint32_t pattern_bitmask[5];
 
 __device__ int count_zero_bytes(uint32_t x) {
     int n = 0;
@@ -104,13 +109,13 @@ __device__ int score_leading_zeros(Address a) {
 __device__ int score_pattern(Address a) {
     uint32_t words[5] = {a.a, a.b, a.c, a.d, a.e};
     int score = 0;
+    #pragma unroll
     for (int w = 0; w < 5; w++) {
-        uint32_t val = words[w];
-        for (int n = 0; n < 8; n++) {
-            int idx = w * 8 + n;
-            uint8_t nibble = (val >> (28 - n * 4)) & 0xF;
-            score += (pattern_mask[idx] && nibble == pattern_nibbles[idx]);
-        }
+        uint32_t diff = words[w] ^ pattern_target[w];
+        diff |= (diff >> 1);
+        diff |= (diff >> 2);
+        diff &= pattern_bitmask[w];
+        score += __popc(~diff & pattern_bitmask[w]);
     }
     return score;
 }
@@ -168,7 +173,7 @@ __device__ void handle_output2(int score_method, Address a, uint64_t key) {
 
 int global_max_score = 0;
 std::mutex global_max_score_mutex;
-uint32_t GRID_SIZE = 1U << 15;
+uint32_t GRID_SIZE = 1U << 17;
 
 struct Message {
     uint64_t time;
@@ -235,6 +240,8 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
         gpu_assert(cudaMemcpyToSymbol(pattern_nibbles, g_pattern_nibbles, 40));
         gpu_assert(cudaMemcpyToSymbol(pattern_mask, g_pattern_mask, 40));
         gpu_assert(cudaMemcpyToSymbol(pattern_total, &g_pattern_total, sizeof(int)));
+        gpu_assert(cudaMemcpyToSymbol(pattern_target, g_pattern_target, 5 * sizeof(uint32_t)));
+        gpu_assert(cudaMemcpyToSymbol(pattern_bitmask, g_pattern_bitmask, 5 * sizeof(uint32_t)));
     }
     gpu_assert(cudaDeviceSynchronize())
 
@@ -725,6 +732,19 @@ int main(int argc, char *argv[]) {
             }
         }
         g_pattern_total = fixed_count;
+        for (int w = 0; w < 5; w++) {
+            uint32_t target = 0;
+            uint32_t bitmask = 0;
+            for (int n = 0; n < 8; n++) {
+                int idx = w * 8 + n;
+                target |= ((uint32_t)g_pattern_nibbles[idx]) << (28 - n * 4);
+                if (g_pattern_mask[idx]) {
+                    bitmask |= (1U << (28 - n * 4));
+                }
+            }
+            g_pattern_target[w] = target;
+            g_pattern_bitmask[w] = bitmask;
+        }
         printf("Pattern: 0x%s (%d fixed nibbles)\n", input_pattern, fixed_count);
         printf("Full match at score %d\n\n", fixed_count);
     }
