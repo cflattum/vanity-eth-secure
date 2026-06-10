@@ -5,5 +5,8 @@
 *.o
 vanity_eth_cuda
 
-# Never commit keys
+# Never commit keys or results (they contain private keys)
 scripts/keys/
+results.txt
+collected-raw.txt
+collected.txt
